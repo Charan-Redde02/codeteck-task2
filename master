@@ -1,0 +1,137 @@
+module spi_master(
+    input clk, rst, start,
+    input [1:0] clkdiv, MODE,
+    input [7:0] DatatoTransmit,
+    output reg finish,
+    output reg [7:0] DataReceived,
+    input MISO,
+    output reg Sclk, SS,
+    output MOSI
+);
+
+    // Intermediate signals
+    wire CPOL, CPHA, Txcomplete;
+    wire clkEn; // This activates Sclk
+    wire [4:0] next_count;
+    reg [4:0] count, halfcycle;
+    reg midcycle, sample_En, shift_En;
+    reg bitcount_En;
+    reg [7:0] MasterReg;
+    reg [7:0] bitcount;
+    reg [1:0] current_state, next_state;
+
+    parameter IDLE = 2'b11;
+    parameter BEGIN = 2'b10;
+    parameter LEAD = 2'b01;
+    parameter TRAIL = 2'b00;
+
+    assign CPOL = (MODE == 2) || (MODE == 3);
+    assign CPHA = (MODE == 1) || (MODE == 3);
+    assign next_count = count + 1'b1;
+    assign clkEn = (next_count == halfcycle);
+
+    // Clock divider
+    always @(*) begin
+        case(clkdiv)
+            2'b00: halfcycle = 5'b00010; // Division by 4
+            2'b01: halfcycle = 5'b00100; // Division by 8
+            2'b10: halfcycle = 5'b01000; // Division by 16
+            2'b11: halfcycle = 5'b10000; // Division by 32
+            default: halfcycle = 5'b00010;
+        endcase
+    end
+
+    // FSM for next state logic
+    always @(*) begin
+        case (current_state)
+            IDLE: next_state <= (!start) ? IDLE : BEGIN;
+            BEGIN: next_state <= LEAD;
+            LEAD: next_state <= (midcycle) ? TRAIL : LEAD;
+            TRAIL: next_state <= (Txcomplete) ? IDLE : (midcycle) ? LEAD : TRAIL;
+            default: next_state <= IDLE;
+        endcase
+    end
+
+    // FSM to generate Sclk
+    always @(*) begin
+        case (current_state)
+            IDLE: begin
+                SS <= 1;
+                Sclk <= CPOL;
+                finish <= 1;
+            end
+            BEGIN: begin
+                SS <= 0;
+                Sclk <= CPOL;
+                finish <= 0;
+            end
+            LEAD: begin
+                SS <= 0;
+                Sclk <= CPOL ^ current_state[0];
+                finish <= 0;
+            end
+            TRAIL: begin
+                SS <= 0;
+                Sclk <= CPOL ^ current_state[0];
+                finish <= Txcomplete ? 1 : 0;
+            end
+            default: ;
+        endcase
+    end
+
+    // Clock divider counter
+    always @(posedge clk) begin
+        if (current_state == IDLE) begin
+            midcycle <= 0;
+            count <= 0;
+        end else begin
+            case ({rst, clkEn})
+                2'b00: begin
+                    midcycle <= 0;
+                    count <= next_count;
+                end
+                2'b01: begin
+                    midcycle <= 1;
+                    count <= 0;
+                end
+                2'b10, 2'b11: begin
+                    midcycle <= 0;
+                    count <= 0;
+                end
+                default: ;
+            endcase
+        end
+    end
+
+    assign Txcomplete = &bitcount;
+
+    // Updating state machine
+    always @(posedge clk) begin
+        if (rst) begin
+            current_state <= IDLE;
+            MasterReg <= 0;
+            DataReceived <= 0;
+            bitcount <= 0;
+        end else begin
+            current_state <= next_state;
+            if (start) 
+                MasterReg <= DatatoTransmit;
+
+            if (Txcomplete)
+                bitcount <= 0;
+            else if (bitcount_En)
+                bitcount <= {bitcount[6:0], 1'b1};
+        end
+    end
+
+    always @(posedge Sclk or negedge Sclk) begin
+        case ({CPOL, CPHA})
+            2'b00: DataReceived <= {DataReceived[6:0], MISO};
+            2'b01, 2'b10: MasterReg <= {MasterReg[6:0], 1'b0};
+            2'b11: DataReceived <= {DataReceived[6:0], MISO};
+        endcase
+    end
+
+    assign MOSI = (SS) ? 1'bz : MasterReg[7];
+
+endmodule
